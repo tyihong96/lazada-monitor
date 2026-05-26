@@ -2,17 +2,12 @@ name: lazada-restock-monitor
 
 on:
   schedule:
-    # Every 1 minute during SG 1:00-2:00pm (UTC 05:00-06:00).
-    # GitHub minimum cron interval IS 1 minute but they only guarantee
-    # 5-min granularity on free tier — runs may be delayed or skipped
-    # under load. In practice you'll get most minutes most days.
     - cron: "* 5 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# Cancel overlapping runs — if a run is slow, don't queue another.
 concurrency:
   group: monitor
   cancel-in-progress: true
@@ -44,6 +39,15 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Commit state
         run: |
