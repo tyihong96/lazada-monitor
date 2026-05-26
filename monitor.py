@@ -1,15 +1,8 @@
 """
-Lazada Pokemon Center SG restock monitor — optimized for fast runs.
+Lazada Pokemon Center SG restock monitor.
 
-Runs on GitHub Actions every 1 min during SG 1:00-2:00pm window.
-Uses Playwright with aggressive timeouts and minimal waits to keep
-each run under ~45 sec, fitting GitHub free tier at 1-min cadence.
-
-Optimizations vs initial version:
-- Block images/fonts/css (Lazada loads ~5MB of these per page)
-- Single explicit wait on the buy-box selector, no extra sleep
-- Bail fast on load errors instead of retrying
-- Reuse browser context across both products in same run
+Diagnostic version: on load_error, dumps the page HTML and a screenshot
+as workflow artifacts so we can see what Lazada actually served.
 """
 import asyncio
 import json
@@ -42,6 +35,7 @@ PRODUCTS = [
 ]
 
 STATE_FILE = Path("state.json")
+DEBUG_DIR = Path("debug")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
@@ -72,7 +66,6 @@ def send_telegram(message):
 
 
 async def block_heavy_resources(route):
-    """Block images, fonts, stylesheets, media — none affect stock state."""
     rtype = route.request.resource_type
     if rtype in ("image", "font", "stylesheet", "media"):
         await route.abort()
@@ -80,18 +73,48 @@ async def block_heavy_resources(route):
         await route.continue_()
 
 
-async def check_stock(page, url):
-    """Return (in_stock: bool, reason: str). Fast path, no retries."""
+async def dump_debug(page, name):
+    """Save HTML + screenshot for failed loads so we can see what happened."""
+    DEBUG_DIR.mkdir(exist_ok=True)
+    slug = name.lower().replace(" ", "_")
     try:
-        # domcontentloaded > networkidle: we want the JS to start, not finish
-        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        # Single wait on the buy-box. If it doesn't appear in 8s, bail.
+        html = await page.content()
+        (DEBUG_DIR / f"{slug}.html").write_text(html[:500_000])
+    except Exception:
+        pass
+    try:
+        await page.screenshot(path=str(DEBUG_DIR / f"{slug}.png"), full_page=False)
+    except Exception:
+        pass
+    # Also log a snippet of the page title and visible text to stdout
+    # so we can see something useful in the logs without downloading artifacts.
+    try:
+        title = await page.title()
+        body_sample = await page.evaluate(
+            "() => document.body ? document.body.innerText.slice(0, 500) : '(no body)'"
+        )
+        print(f"  DEBUG title: {title!r}")
+        print(f"  DEBUG body sample: {body_sample!r}")
+    except Exception as e:
+        print(f"  DEBUG dump failed: {e}")
+
+
+async def check_stock(page, url, name):
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+    except Exception as e:
+        await dump_debug(page, name)
+        return False, f"goto_error: {type(e).__name__}"
+
+    # Try to find the buy-box. If it doesn't appear, dump debug info.
+    try:
         await page.wait_for_selector(
-            '[data-spm="buybox"], .pdp-block--buy-now, #module_add_to_cart',
-            timeout=8000,
+            '[data-spm="buybox"], .pdp-block--buy-now, #module_add_to_cart, .pdp-product-price',
+            timeout=10000,
         )
     except Exception as e:
-        return False, f"load_error: {type(e).__name__}"
+        await dump_debug(page, name)
+        return False, f"selector_error: {type(e).__name__}"
 
     try:
         body_text = await page.evaluate(
@@ -145,16 +168,19 @@ async def main():
             ),
             viewport={"width": 390, "height": 844},
             locale="en-SG",
+            # Extra headers to look more like a real mobile browser
+            extra_http_headers={
+                "Accept-Language": "en-SG,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
         )
-        # Block heavy resources globally for this context.
         await context.route("**/*", block_heavy_resources)
-
         page = await context.new_page()
 
         for product in PRODUCTS:
             name = product["name"]
             url = product["url"]
-            in_stock, reason = await check_stock(page, url)
+            in_stock, reason = await check_stock(page, url, name)
             prev = state.get(name, {}).get("in_stock", False)
 
             print(f"{name}: in_stock={in_stock} reason={reason} prev={prev}")
