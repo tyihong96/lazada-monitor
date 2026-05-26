@@ -1,8 +1,12 @@
 """
 Lazada Pokemon Center SG restock monitor.
 
-Diagnostic version: on load_error, dumps the page HTML and a screenshot
-as workflow artifacts so we can see what Lazada actually served.
+Strategy: load page, wait for it to be reasonably settled, then check
+the FULL rendered body text for stock markers. We don't require any
+specific selector to exist — the markers are what we care about.
+
+This is more forgiving than the previous selector-based approach,
+which broke when Lazada's PDP layout changed.
 """
 import asyncio
 import json
@@ -37,7 +41,7 @@ PRODUCTS = [
 STATE_FILE = Path("state.json")
 DEBUG_DIR = Path("debug")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()  # strip trailing whitespace
 
 
 def load_state():
@@ -73,10 +77,9 @@ async def block_heavy_resources(route):
         await route.continue_()
 
 
-async def dump_debug(page, name):
-    """Save HTML + screenshot for failed loads so we can see what happened."""
+async def dump_debug(page, name, suffix=""):
     DEBUG_DIR.mkdir(exist_ok=True)
-    slug = name.lower().replace(" ", "_")
+    slug = name.lower().replace(" ", "_") + suffix
     try:
         html = await page.content()
         (DEBUG_DIR / f"{slug}.html").write_text(html[:500_000])
@@ -86,66 +89,94 @@ async def dump_debug(page, name):
         await page.screenshot(path=str(DEBUG_DIR / f"{slug}.png"), full_page=False)
     except Exception:
         pass
-    # Also log a snippet of the page title and visible text to stdout
-    # so we can see something useful in the logs without downloading artifacts.
-    try:
-        title = await page.title()
-        body_sample = await page.evaluate(
-            "() => document.body ? document.body.innerText.slice(0, 500) : '(no body)'"
-        )
-        print(f"  DEBUG title: {title!r}")
-        print(f"  DEBUG body sample: {body_sample!r}")
-    except Exception as e:
-        print(f"  DEBUG dump failed: {e}")
 
 
 async def check_stock(page, url, name):
+    """
+    Returns (in_stock: bool, reason: str).
+
+    Approach:
+    1. Load the page with a 20s timeout.
+    2. Wait briefly for the buy-box area to render. If our preferred
+       selectors don't exist, fall back to a small fixed delay and
+       proceed anyway.
+    3. Pull the FULL body text and look for stock markers.
+    4. Special case: explicit "no longer available" page → delisted.
+    """
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=20000)
     except Exception as e:
-        await dump_debug(page, name)
+        await dump_debug(page, name, "_goto_fail")
         return False, f"goto_error: {type(e).__name__}"
 
-    # Try to find the buy-box. If it doesn't appear, dump debug info.
+    # Try the buy-box selectors with a short timeout. If they don't
+    # exist (Lazada PDP layout varies), just wait a bit and continue.
     try:
         await page.wait_for_selector(
-            '[data-spm="buybox"], .pdp-block--buy-now, #module_add_to_cart, .pdp-product-price',
-            timeout=10000,
+            '[data-spm="buybox"], .pdp-block--buy-now, #module_add_to_cart, '
+            '.pdp-product-price, .pdp-cart-concern, [class*="buyBoxBtn"], '
+            '[class*="addToCart"]',
+            timeout=5000,
         )
-    except Exception as e:
-        await dump_debug(page, name)
-        return False, f"selector_error: {type(e).__name__}"
+    except Exception:
+        # Selector miss is fine — Lazada may have changed class names.
+        # Give the page a little more time to settle, then proceed.
+        await page.wait_for_timeout(2500)
 
     try:
         body_text = await page.evaluate(
-            """
-            () => {
-              const candidates = [
-                document.querySelector('[data-spm="buybox"]'),
-                document.querySelector('.pdp-block--buy-now'),
-                document.querySelector('.pdp-cart-concern'),
-                document.querySelector('#module_add_to_cart'),
-              ].filter(Boolean);
-              if (candidates.length === 0) return document.body.innerText;
-              return candidates.map(el => el.innerText).join('\\n');
-            }
-            """
+            "() => document.body ? document.body.innerText : ''"
         )
     except Exception as e:
         return False, f"eval_error: {e}"
 
+    if not body_text:
+        await dump_debug(page, name, "_empty_body")
+        return False, "empty_body"
+
     text_lower = body_text.lower()
-    out_markers = ["out of stock", "sold out", "notify me when available", "notify me"]
-    in_markers = ["add to cart", "buy now"]
+
+    # Delisted check first — overrides everything else
+    delisted_markers = [
+        "this product is no longer available",
+        "product is no longer available",
+        "sorry! this product",
+    ]
+    if any(m in text_lower for m in delisted_markers):
+        return False, "delisted"
+
+    out_markers = [
+        "out of stock",
+        "sold out",
+        "notify me when available",
+        "currently unavailable",
+    ]
+    in_markers = [
+        "add to cart",
+        "buy now",
+        "add to wishlist",  # WEAK marker — usually accompanies add to cart
+    ]
 
     has_out = any(m in text_lower for m in out_markers)
-    has_in = any(m in text_lower for m in in_markers)
+    has_in_strong = any(m in text_lower for m in in_markers[:2])  # add to cart / buy now
+    has_in_weak = "add to wishlist" in text_lower
 
+    # If both an OOS marker AND a strong in-stock marker appear, trust
+    # the OOS marker — Lazada often renders "Add to Cart" text in JS
+    # bundles or hidden elements even when sold out.
     if has_out:
         return False, "out_of_stock"
-    if has_in:
-        return True, "add_to_cart_visible"
-    return False, f"no_marker (sample={body_text[:200]!r})"
+    if has_in_strong:
+        return True, "in_stock"
+    if has_in_weak:
+        # Only "Add to Wishlist" with no other signal: could be either.
+        # Dump for inspection and treat as ambiguous (out of stock by default).
+        await dump_debug(page, name, "_ambiguous")
+        return False, f"ambiguous (sample={body_text[:300]!r})"
+
+    # No marker found at all — page structure may have changed.
+    await dump_debug(page, name, "_no_marker")
+    return False, f"no_marker (sample={body_text[:300]!r})"
 
 
 async def main():
@@ -168,7 +199,6 @@ async def main():
             ),
             viewport={"width": 390, "height": 844},
             locale="en-SG",
-            # Extra headers to look more like a real mobile browser
             extra_http_headers={
                 "Accept-Language": "en-SG,en;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
