@@ -1,7 +1,7 @@
 {
   "Chaos Rising ETB": {
-    "in_stock": true,
-    "reason": "in_stock"
+    "in_stock": false,
+    "reason": "no_clear_signal"
   },
   "Ascended Heroes ETB": {
     "in_stock": false,
