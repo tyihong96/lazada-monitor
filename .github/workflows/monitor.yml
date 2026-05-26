@@ -1,0 +1,54 @@
+name: lazada-restock-monitor
+
+on:
+  schedule:
+    # Every 1 minute during SG 1:00-2:00pm (UTC 05:00-06:00).
+    # GitHub minimum cron interval IS 1 minute but they only guarantee
+    # 5-min granularity on free tier — runs may be delayed or skipped
+    # under load. In practice you'll get most minutes most days.
+    - cron: "* 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Cancel overlapping runs — if a run is slow, don't queue another.
+concurrency:
+  group: monitor
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-v1
+
+      - name: Install deps
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add state.json || true
+          git diff --cached --quiet || git commit -m "update state"
+          git push || true
