@@ -6,15 +6,13 @@ Detection rule:
 - Out of stock: "Item Not Available" or only "Add to Wishlist"
 - Delisted: "this product is no longer available" page
 
-Each product has TWO URLs:
-- monitor_url: canonical product URL we poll (stable, no token expiry)
-- app_url: short s.lazada.sg link sent in alerts (opens Lazada app
-  directly on phones with the app installed)
+Sends a daily heartbeat to Telegram so you know the bot is alive.
 """
 import asyncio
 import json
 import os
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -47,6 +45,8 @@ STATE_FILE = Path("state.json")
 DEBUG_DIR = Path("debug")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
+
+SG_TZ = timezone(timedelta(hours=8))
 
 
 def load_state():
@@ -153,8 +153,26 @@ async def check_stock(page, url, name):
     return False, "no_clear_signal"
 
 
+def maybe_send_heartbeat(state, statuses):
+    """
+    Send a daily heartbeat at the FIRST run of each SG day (13:00 SG).
+    Includes current state of both products so you can sanity-check
+    that the bot is seeing what you expect.
+    """
+    today_sg = datetime.now(SG_TZ).strftime("%Y-%m-%d")
+    last_heartbeat = state.get("_last_heartbeat")
+    if last_heartbeat == today_sg:
+        return  # already sent today
+    lines = [f"💓 Bot alive — {today_sg} 1pm SG"]
+    for name, reason in statuses:
+        lines.append(f"• <b>{name}</b>: {reason}")
+    send_telegram("\n".join(lines))
+    state["_last_heartbeat"] = today_sg
+
+
 async def main():
     state = load_state()
+    statuses = []  # (name, reason) for heartbeat
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -183,6 +201,7 @@ async def main():
             in_stock, reason = await check_stock(page, product["monitor_url"], name)
             prev = state.get(name, {}).get("in_stock", False)
             print(f"{name}: in_stock={in_stock} reason={reason} prev={prev}")
+            statuses.append((name, reason))
 
             if in_stock and not prev:
                 send_telegram(
@@ -198,6 +217,9 @@ async def main():
             state[name] = {"in_stock": in_stock, "reason": reason}
 
         await browser.close()
+
+    # Daily heartbeat — once per SG day, after the checks succeed
+    maybe_send_heartbeat(state, statuses)
 
     save_state(state)
     return 0
