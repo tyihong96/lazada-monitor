@@ -1,10 +1,10 @@
 {
   "Chaos Rising ETB": {
-    "in_stock": false,
-    "reason": "selector_error: TimeoutError"
+    "in_stock": true,
+    "reason": "in_stock"
   },
   "Ascended Heroes ETB": {
     "in_stock": false,
-    "reason": "selector_error: TimeoutError"
+    "reason": "delisted"
   }
 }
